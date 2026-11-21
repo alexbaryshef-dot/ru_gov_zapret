@@ -40,7 +40,7 @@ jobs:
           CAT_URL=$(curl -fsSL 'https://api.thecatapi.com/v1/images/search' | jq -r '.[0].url')
           echo "CAT_URL=$CAT_URL" >> $GITHUB_ENV
           echo 'RELEASE_BODY<<EOF' >> $GITHUB_ENV
-          echo "Updated filtered GeoSite database 🐱" >> $GITHUB_ENV
+          echo "Filtered AntiFilter GeoSite database" >> $GITHUB_ENV
           echo "<img src=\"$CAT_URL\" width=\"400\">" >> $GITHUB_ENV
           echo "" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
@@ -50,12 +50,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p input
+
           curl -fL --retry 3 \
             https://antifilter.download/list/domains.lst \
             -o input/zapret
+
           curl -fL --retry 3 \
             https://community.antifilter.download/list/domains.lst \
             -o input/zapret-zapad
+
           test -s input/zapret
           test -s input/zapret-zapad
 
@@ -97,11 +100,17 @@ jobs:
                   return None
 
               line = line.split("#", 1)[0].strip()
+
               if not line:
                   return None
 
+              # domain:example.com and :example.com
+              line = re.sub(r"^domain:", "", line, flags=re.I)
+              line = line.lstrip(":")
+
               parts = line.split()
 
+              # Hosts format
               if len(parts) >= 2:
                   try:
                       ipaddress.ip_address(parts[0])
@@ -112,10 +121,12 @@ jobs:
               if line.startswith("@@"):
                   return None
 
+              # Adblock syntax
               line = line.removeprefix("||").removeprefix("|")
               line = line.split("$", 1)[0].rstrip("^|")
               line = line.removeprefix("*.")
 
+              # URL syntax
               if "://" in line:
                   try:
                       line = urlsplit(line).hostname or ""
@@ -152,36 +163,46 @@ jobs:
 
               return line
 
-          excluded = set()
-
+          # Downloaded gambling sources
           sources = [
               "input/gambling/arkynx.txt",
               "input/gambling/betblocker.txt",
               "input/gambling/hagezi.txt",
           ]
 
+          excluded = set()
+
           for filename in sources:
               count = 0
+
               for line in Path(filename).read_text(
-                  encoding="utf-8", errors="replace"
+                  encoding="utf-8",
+                  errors="replace"
               ).splitlines():
+
                   domain = normalize(line)
+
                   if domain:
                       excluded.add(domain)
                       count += 1
+
               print(f"{filename}: {count} domains")
 
+          # Personal exclusions
           personal = Path("code/exclude-domains.txt")
 
           if personal.exists():
               for line in personal.read_text(
-                  encoding="utf-8", errors="replace"
+                  encoding="utf-8",
+                  errors="replace"
               ).splitlines():
+
                   domain = normalize(line)
+
                   if domain:
                       excluded.add(domain)
 
-          # Guaranteed manual exclusions
+          # Guaranteed brand exclusions
           excluded.update({
               "1win.com",
               "1win.ru",
@@ -189,8 +210,11 @@ jobs:
               "1win.pro",
               "1win.bet",
               "1win.app",
+              "1win.online",
               "1xbet.com",
               "1xbet.ru",
+              "1xbet.io",
+              "1xbet.bet",
           })
 
           if len(excluded) < 100:
@@ -198,57 +222,68 @@ jobs:
                   f"ERROR: Too few exclusion domains: {len(excluded)}"
               )
 
-          # Use a reversed domain tree for efficient subdomain matching
-          blocked = set()
-
-          for domain in excluded:
-              parts = domain.split(".")
-              for i in range(len(parts)):
-                  blocked.add(".".join(parts[i:]))
-
           print(f"Total unique exclusions: {len(excluded)}")
 
+          # Filter both AntiFilter lists
           for filename in ["input/zapret", "input/zapret-zapad"]:
+
               path = Path(filename)
 
               original = path.read_text(
-                  encoding="utf-8", errors="replace"
+                  encoding="utf-8",
+                  errors="replace"
               ).splitlines()
 
               result = []
-              removed = 0
               seen = set()
+              removed = 0
+              duplicates = 0
 
               for line in original:
+
                   domain = normalize(line)
 
                   if not domain:
                       continue
 
                   parts = domain.split(".")
-                  is_blocked = any(
-                      ".".join(parts[i:]) in excluded
-                      for i in range(len(parts) - 1)
-                  ) or domain in excluded
+
+                  # Exact exclusion, parent exclusion,
+                  # and all subdomains
+                  is_blocked = (
+                      domain in excluded
+                      or any(
+                          ".".join(parts[i:]) in excluded
+                          for i in range(1, len(parts))
+                      )
+                      # Brand mirrors: 1win*, 1xbet*
+                      or any(
+                          label.startswith(("1win", "1xbet"))
+                          for label in parts
+                      )
+                  )
 
                   if is_blocked:
                       removed += 1
                       continue
 
-                  if domain not in seen:
-                      seen.add(domain)
-                      result.append(domain)
+                  if domain in seen:
+                      duplicates += 1
+                      continue
+
+                  seen.add(domain)
+                  result.append(domain)
 
               path.write_text(
                   "\n".join(result) + "\n",
                   encoding="utf-8"
               )
 
-              print(
-                  f"{filename}: removed {removed}; "
-                  f"remaining {len(result)}; "
-                  f"duplicates removed {len(original) - removed - len(result)}"
-              )
+              print(f"\n{filename}")
+              print(f"Original: {len(original)}")
+              print(f"Removed gambling: {removed}")
+              print(f"Duplicates: {duplicates}")
+              print(f"Remaining: {len(result)}")
 
           PY
 
@@ -268,12 +303,30 @@ jobs:
           test -s ../publish/zapret.txt
           test -s ../publish/zapret-zapad.txt
 
+      - name: Verify brand exclusions
+        run: |
+          set -euo pipefail
+
+          for file in publish/zapret.txt publish/zapret-zapad.txt; do
+            if grep -Ei '(^|[.])1win[^.]*[.]|(^|[.])1xbet[^.]*[.]' "$file"; then
+              echo "ERROR: 1WIN/1XBET domain remains in $file"
+              exit 1
+            fi
+          done
+
+          echo "1WIN and 1XBET checks passed"
+
       - name: Generate hashes
         run: |
           set -euo pipefail
-          sha256sum publish/zapret.dat > publish/zapret.dat.sha256sum
+
+          sha256sum publish/zapret.dat \
+            > publish/zapret.dat.sha256sum
+
           cd publish
-          sha256sum zapret.txt zapret-zapad.txt > lists.sha256sum
+
+          sha256sum zapret.txt zapret-zapad.txt \
+            > lists.sha256sum
 
       - name: Release and upload assets
         run: |
@@ -290,5 +343,6 @@ jobs:
             ../publish/lists.sha256sum
         env:
           GH_TOKEN: ${{ github.token }}
+
 
 
