@@ -37,43 +37,258 @@ jobs:
 
       - name: Get random cat
         run: |
-          CAT_URL=$(curl -s 'https://api.thecatapi.com/v1/images/search' | jq -r '.[0].url')
+          CAT_URL=$(curl -fsSL 'https://api.thecatapi.com/v1/images/search' | jq -r '.[0].url')
           echo "CAT_URL=$CAT_URL" >> $GITHUB_ENV
           echo 'RELEASE_BODY<<EOF' >> $GITHUB_ENV
-          echo "Today's release comes with a special cat! 🐱" >> $GITHUB_ENV
+          echo "Updated filtered GeoSite database 🐱" >> $GITHUB_ENV
           echo "<img src=\"$CAT_URL\" width=\"400\">" >> $GITHUB_ENV
           echo "" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
         shell: bash
 
-      - name: Download Antifilter lists
+      - name: Download AntiFilter lists
         run: |
+          set -euo pipefail
           mkdir -p input
-          curl -fL "https://antifilter.download/list/domains.lst" -o ./input/zapret
-          curl -fL "https://community.antifilter.download/list/domains.lst" -o ./input/zapret-zapad
+          curl -fL --retry 3 \
+            https://antifilter.download/list/domains.lst \
+            -o input/zapret
+          curl -fL --retry 3 \
+            https://community.antifilter.download/list/domains.lst \
+            -o input/zapret-zapad
+          test -s input/zapret
+          test -s input/zapret-zapad
+
+      - name: Download gambling blocklists
+        run: |
+          set -euo pipefail
+          mkdir -p input/gambling
+
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/arkynx/blocklists/refs/heads/main/gambling-domains.txt \
+            -o input/gambling/arkynx.txt
+
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/bet-blocker/bet-blocker/refs/heads/main/hosts \
+            -o input/gambling/betblocker.txt
+
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling-onlydomains.txt \
+            -o input/gambling/hagezi.txt
+
+          test -s input/gambling/arkynx.txt
+          test -s input/gambling/betblocker.txt
+          test -s input/gambling/hagezi.txt
+
+      - name: Normalize and filter domains
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import ipaddress
+          import re
+          from urllib.parse import urlsplit
+
+          def normalize(line):
+              line = line.strip()
+
+              if not line or line.startswith(("#", "!")):
+                  return None
+
+              line = line.split("#", 1)[0].strip()
+              if not line:
+                  return None
+
+              parts = line.split()
+
+              if len(parts) >= 2:
+                  try:
+                      ipaddress.ip_address(parts[0])
+                      line = parts[1]
+                  except ValueError:
+                      line = parts[0]
+
+              if line.startswith("@@"):
+                  return None
+
+              line = line.removeprefix("||").removeprefix("|")
+              line = line.split("$", 1)[0].rstrip("^|")
+              line = line.removeprefix("*.")
+
+              if "://" in line:
+                  try:
+                      line = urlsplit(line).hostname or ""
+                  except ValueError:
+                      return None
+              else:
+                  line = line.split("/", 1)[0].split("?", 1)[0]
+
+              line = line.strip().strip(".").lower()
+
+              if ":" in line:
+                  return None
+
+              try:
+                  line = line.encode("idna").decode("ascii")
+              except UnicodeError:
+                  return None
+
+              labels = line.split(".")
+
+              if len(line) > 253 or len(labels) < 2:
+                  return None
+
+              if any(
+                  not label
+                  or len(label) > 63
+                  or not re.fullmatch(
+                      r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?",
+                      label
+                  )
+                  for label in labels
+              ):
+                  return None
+
+              return line
+
+          excluded = set()
+
+          sources = [
+              "input/gambling/arkynx.txt",
+              "input/gambling/betblocker.txt",
+              "input/gambling/hagezi.txt",
+          ]
+
+          for filename in sources:
+              count = 0
+              for line in Path(filename).read_text(
+                  encoding="utf-8", errors="replace"
+              ).splitlines():
+                  domain = normalize(line)
+                  if domain:
+                      excluded.add(domain)
+                      count += 1
+              print(f"{filename}: {count} domains")
+
+          personal = Path("code/exclude-domains.txt")
+
+          if personal.exists():
+              for line in personal.read_text(
+                  encoding="utf-8", errors="replace"
+              ).splitlines():
+                  domain = normalize(line)
+                  if domain:
+                      excluded.add(domain)
+
+          # Guaranteed manual exclusions
+          excluded.update({
+              "1win.com",
+              "1win.ru",
+              "1win.io",
+              "1win.pro",
+              "1win.bet",
+              "1win.app",
+              "1xbet.com",
+              "1xbet.ru",
+          })
+
+          if len(excluded) < 100:
+              raise SystemExit(
+                  f"ERROR: Too few exclusion domains: {len(excluded)}"
+              )
+
+          # Use a reversed domain tree for efficient subdomain matching
+          blocked = set()
+
+          for domain in excluded:
+              parts = domain.split(".")
+              for i in range(len(parts)):
+                  blocked.add(".".join(parts[i:]))
+
+          print(f"Total unique exclusions: {len(excluded)}")
+
+          for filename in ["input/zapret", "input/zapret-zapad"]:
+              path = Path(filename)
+
+              original = path.read_text(
+                  encoding="utf-8", errors="replace"
+              ).splitlines()
+
+              result = []
+              removed = 0
+              seen = set()
+
+              for line in original:
+                  domain = normalize(line)
+
+                  if not domain:
+                      continue
+
+                  parts = domain.split(".")
+                  is_blocked = any(
+                      ".".join(parts[i:]) in excluded
+                      for i in range(len(parts) - 1)
+                  ) or domain in excluded
+
+                  if is_blocked:
+                      removed += 1
+                      continue
+
+                  if domain not in seen:
+                      seen.add(domain)
+                      result.append(domain)
+
+              path.write_text(
+                  "\n".join(result) + "\n",
+                  encoding="utf-8"
+              )
+
+              print(
+                  f"{filename}: removed {removed}; "
+                  f"remaining {len(result)}; "
+                  f"duplicates removed {len(original) - removed - len(result)}"
+              )
+
+          PY
 
       - name: Build .dat and export lists
         run: |
+          set -euo pipefail
           mkdir -p publish
-          cd code || exit 1
-          go run ./ --datapath=../input --outputdir=../publish --exportlists=zapret,zapret-zapad --outputname=zapret.dat
+          cd code
+
+          go run ./ \
+            --datapath=../input \
+            --outputdir=../publish \
+            --exportlists=zapret,zapret-zapad \
+            --outputname=zapret.dat
+
+          test -s ../publish/zapret.dat
+          test -s ../publish/zapret.txt
+          test -s ../publish/zapret-zapad.txt
 
       - name: Generate hashes
         run: |
-          cd publish || exit 1
-          sha256sum zapret.dat > zapret.dat.sha256sum
-          sha256sum *.txt > lists.sha256sum
+          set -euo pipefail
+          sha256sum publish/zapret.dat > publish/zapret.dat.sha256sum
+          cd publish
+          sha256sum zapret.txt zapret-zapad.txt > lists.sha256sum
 
       - name: Release and upload assets
         run: |
-          cd code || exit 1
+          set -euo pipefail
+          cd code
+
           gh release create "${{ env.TAG_NAME }}" \
             -t "${{ env.RELEASE_NAME }}" \
             -n "${{ env.RELEASE_BODY }}" \
             ../publish/zapret.dat \
             ../publish/zapret.dat.sha256sum \
-            ../publish/*.txt \
+            ../publish/zapret.txt \
+            ../publish/zapret-zapad.txt \
             ../publish/lists.sha256sum
         env:
           GH_TOKEN: ${{ github.token }}
+
 
