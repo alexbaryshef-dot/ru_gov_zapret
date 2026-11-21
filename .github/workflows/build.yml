@@ -1,4 +1,5 @@
 name: zapret .dat
+
 on:
   workflow_dispatch:
   schedule:
@@ -8,6 +9,10 @@ on:
       - main
     paths-ignore:
       - "**/README.md"
+
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build
@@ -44,26 +49,31 @@ jobs:
       - name: Download Antifilter lists
         run: |
           mkdir -p input
-          curl -L "https://antifilter.download/list/domains.lst" -o ./input/zapret
-          curl -L "https://community.antifilter.download/list/domains.lst" -o ./input/zapret-zapad
+          curl -fL "https://antifilter.download/list/domains.lst" -o ./input/zapret
+          curl -fL "https://community.antifilter.download/list/domains.lst" -o ./input/zapret-zapad
 
-      - name: Build .dat file
+      - name: Build .dat and export lists
         run: |
           mkdir -p publish
           cd code || exit 1
           go run ./ --datapath=../input --outputdir=../publish --exportlists=zapret,zapret-zapad --outputname=zapret.dat
 
-      - name: Generate hash
+      - name: Generate hashes
         run: |
-          sha256sum ./publish/zapret.dat > ./publish/zapret.dat.sha256sum
+          cd publish || exit 1
+          sha256sum zapret.dat > zapret.dat.sha256sum
+          sha256sum *.txt > lists.sha256sum
 
       - name: Release and upload assets
         run: |
           cd code || exit 1
-          gh release create ${{ env.TAG_NAME }} \
-            -t ${{ env.RELEASE_NAME }} \
+          gh release create "${{ env.TAG_NAME }}" \
+            -t "${{ env.RELEASE_NAME }}" \
             -n "${{ env.RELEASE_BODY }}" \
-            ../publish/*.dat \
-            ../publish/*.dat.sha256sum
+            ../publish/zapret.dat \
+            ../publish/zapret.dat.sha256sum \
+            ../publish/*.txt \
+            ../publish/lists.sha256sum
         env:
           GH_TOKEN: ${{ github.token }}
+
